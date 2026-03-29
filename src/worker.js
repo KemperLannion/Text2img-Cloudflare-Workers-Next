@@ -9,31 +9,44 @@
 // import html template
 import HTML from './index.html';
 
+// Feature switches
+const ENABLE_PROMPT_GENERATOR = true;
+const PROMPT_GENERATOR_MODEL = '@cf/meta/llama-3.1-8b-instruct';
+const ENABLE_R2_UPLOAD = true;
+const R2_BUCKET_BINDING = 'IMAGE_BUCKET';
+// Set your R2 public custom domain base URL (e.g. https://img.example.com). Keep empty to only return object key.
+const R2_PUBLIC_BASE_URL = '';
+const DEFAULT_IMAGE_TO_IMAGE_STRENGTH = 0.65;
+
 // Available models list
 const AVAILABLE_MODELS = [
   {
     id: 'stable-diffusion-xl-base-1.0',
     name: 'Stable Diffusion XL Base 1.0',
     description: 'Stability AI SDXL 文生图模型',
-    key: '@cf/stabilityai/stable-diffusion-xl-base-1.0'
+    key: '@cf/stabilityai/stable-diffusion-xl-base-1.0',
+    supportsImageToImage: true
   },
   {
     id: 'flux-1-schnell',
     name: 'FLUX.1 [schnell]',
     description: '精确细节表现的高性能文生图模型',
-    key: '@cf/black-forest-labs/flux-1-schnell'
+    key: '@cf/black-forest-labs/flux-1-schnell',
+    supportsImageToImage: false
   },
   {
     id: 'dreamshaper-8-lcm',
     name: 'DreamShaper 8 LCM',
     description: '增强图像真实感的 SD 微调模型',
-    key: '@cf/lykon/dreamshaper-8-lcm'
+    key: '@cf/lykon/dreamshaper-8-lcm',
+    supportsImageToImage: true
   },
   {
     id: 'stable-diffusion-xl-lightning',
     name: 'Stable Diffusion XL Lightning',
     description: '更加高效的文生图模型',
-    key: '@cf/bytedance/stable-diffusion-xl-lightning'
+    key: '@cf/bytedance/stable-diffusion-xl-lightning',
+    supportsImageToImage: true
   }
 ];
 
@@ -55,17 +68,99 @@ const RANDOM_PROMPTS = [
 // demo: const PASSWORDS = ['P@ssw0rd']
 const PASSWORDS = []
 
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Expose-Headers': 'X-R2-Key, X-R2-Url',
+};
+
+function jsonResponse(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'application/json'
+    }
+  });
+}
+
+function clampNumber(value, min, max) {
+  const num = Number(value);
+  if (Number.isNaN(num)) return min;
+  return Math.min(max, Math.max(min, num));
+}
+
+function decodeBase64ToBytes(base64) {
+  const binaryString = atob(base64);
+  const bytes = new Uint8Array(binaryString.length);
+  for (let i = 0; i < binaryString.length; i++) {
+    bytes[i] = binaryString.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function normalizeInitImage(imageInput) {
+  if (!imageInput || typeof imageInput !== 'string') return '';
+  const trimmed = imageInput.trim();
+  if (!trimmed) return '';
+  const dataUrlMatch = trimmed.match(/^data:image\/[a-zA-Z0-9.+-]+;base64,(.+)$/);
+  if (dataUrlMatch) return dataUrlMatch[1];
+  return trimmed;
+}
+
+function extractPromptText(response) {
+  if (!response) return '';
+  if (typeof response === 'string') return response.trim();
+  if (typeof response.response === 'string') return response.response.trim();
+  if (typeof response.result === 'string') return response.result.trim();
+  const choiceText = response.choices?.[0]?.message?.content;
+  if (typeof choiceText === 'string') return choiceText.trim();
+  return '';
+}
+
+async function toImageBytes(response, modelId) {
+  if (modelId === 'flux-1-schnell') {
+    const parsed = typeof response === 'string' ? JSON.parse(response) : response;
+    if (!parsed?.image) {
+      throw new Error('Image data not found in flux response');
+    }
+    return decodeBase64ToBytes(parsed.image);
+  }
+
+  if (response instanceof Uint8Array) return response;
+  if (response instanceof ArrayBuffer) return new Uint8Array(response);
+  if (response instanceof ReadableStream) {
+    const buffer = await new Response(response).arrayBuffer();
+    return new Uint8Array(buffer);
+  }
+  if (typeof response === 'object' && response?.image) return decodeBase64ToBytes(response.image);
+  if (typeof response === 'string') return decodeBase64ToBytes(response);
+
+  throw new Error('Unsupported image response format');
+}
+
+async function uploadToR2IfEnabled(env, bytes, modelId) {
+  const bucket = env[R2_BUCKET_BINDING];
+  if (!ENABLE_R2_UPLOAD || !bucket) return null;
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const key = `generated/${timestamp}-${modelId}-${crypto.randomUUID()}.png`;
+  await bucket.put(key, bytes, {
+    httpMetadata: {
+      contentType: 'image/png'
+    }
+  });
+
+  const base = R2_PUBLIC_BASE_URL.trim().replace(/\/+$/, '');
+  const url = base ? `${base}/${key}` : '';
+  return { key, url };
+}
+
 
 export default {
   async fetch(request, env) {
     const originalHost = request.headers.get("host");
-
-    // CORS Headers
-    const corsHeaders = {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
-    };
 
     if (request.method === 'OPTIONS') {
       return new Response(null, {
@@ -80,39 +175,67 @@ export default {
       // process api requests
       if (path === '/api/models') {
         // get available models list
-        return new Response(JSON.stringify(AVAILABLE_MODELS), {
-          headers: {
-            ...corsHeaders,
-            'Content-Type': 'application/json'
-          }
+        return jsonResponse(AVAILABLE_MODELS);
+      } else if (path === '/api/config') {
+        return jsonResponse({
+          promptGeneratorEnabled: ENABLE_PROMPT_GENERATOR,
+          r2UploadEnabled: ENABLE_R2_UPLOAD && Boolean(env[R2_BUCKET_BINDING]),
+          imageToImageDefaultStrength: DEFAULT_IMAGE_TO_IMAGE_STRENGTH
         });
       } else if (path === '/api/prompts') {
         // get random prompts list
-        return new Response(JSON.stringify(RANDOM_PROMPTS), {
-          headers: {
-            ...corsHeaders,
-            'Content-Type': 'application/json'
-          }
+        return jsonResponse(RANDOM_PROMPTS);
+      } else if (path === '/api/prompt-generator' && request.method === 'POST') {
+        if (!ENABLE_PROMPT_GENERATOR) {
+          return jsonResponse({ error: 'Prompt generator is disabled in worker.js' }, 403);
+        }
+
+        const data = await request.json();
+        const text = (data?.text || '').trim();
+        if (!text) {
+          return jsonResponse({ error: 'Missing required parameter: text' }, 400);
+        }
+
+        const llmResponse = await env.AI.run(PROMPT_GENERATOR_MODEL, {
+          messages: [
+            {
+              role: 'system',
+              content: '你是专业的文生图提示词助手。请把用户自然语言改写成高质量、可直接用于图像生成模型的英文提示词。只返回提示词本身，不要解释。'
+            },
+            {
+              role: 'user',
+              content: text
+            }
+          ],
+          temperature: 0.7,
+          max_tokens: 220
         });
-      } else if (request.method === 'POST') {
+
+        const prompt = extractPromptText(llmResponse);
+        if (!prompt) {
+          return jsonResponse({ error: 'Failed to generate prompt text' }, 500);
+        }
+        return jsonResponse({ prompt });
+      } else if (request.method === 'POST' && (path === '/' || path === '/api/generate')) {
         // process POST request for image generation
         const data = await request.json();
         
         // Check if password is required and valid
         if (PASSWORDS.length > 0 && (!data.password || !PASSWORDS.includes(data.password))) {
-          return new Response(JSON.stringify({ error: 'Please enter the correct password' }), { 
-            status: 403, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-          });
+          return jsonResponse({ error: 'Please enter the correct password' }, 403);
         }
         
         if ('prompt' in data && 'model' in data) {
           const selectedModel = AVAILABLE_MODELS.find(m => m.id === data.model);
           if (!selectedModel) {
-            return new Response(JSON.stringify({ error: 'Model is invalid' }), { 
-              status: 400,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
+            return jsonResponse({ error: 'Model is invalid' }, 400);
+          }
+
+          const useImageToImage = Boolean(data.use_image_to_image);
+          if (useImageToImage && !selectedModel.supportsImageToImage) {
+            return jsonResponse({
+              error: 'The selected model does not support image-to-image generation'
+            }, 400);
           }
           
           const model = selectedModel.key;
@@ -120,9 +243,7 @@ export default {
           
           // Input parameter processing
           if (data.model === 'flux-1-schnell') {
-            let steps = data.num_steps || 6;
-            if (steps >= 8) steps = 8;
-            else if (steps <= 4) steps = 4;
+            const steps = clampNumber(data.num_steps || 6, 4, 8);
             
             // Only prompt and steps
             inputs = {
@@ -136,98 +257,47 @@ export default {
               negative_prompt: data.negative_prompt || '',
               height: data.height || 1024,
               width: data.width || 1024,
-              num_steps: data.num_steps || 20,
-              strength: data.strength || 0.1,
-              guidance: data.guidance || 7.5,
-              seed: data.seed || parseInt((Math.random() * 1024 * 1024).toString(), 10),
-            };
+                num_steps: data.num_steps || 20,
+                strength: clampNumber(data.strength || DEFAULT_IMAGE_TO_IMAGE_STRENGTH, 0, 1),
+                guidance: data.guidance || 7.5,
+                seed: data.seed || parseInt((Math.random() * 1024 * 1024).toString(), 10),
+              };
+
+              if (useImageToImage) {
+                const normalizedImage = normalizeInitImage(data.init_image);
+                if (!normalizedImage) {
+                  return jsonResponse({ error: 'Missing required parameter: init_image' }, 400);
+                }
+                inputs.image = normalizedImage;
+              }
           }
 
           console.log(`Generating image with ${model} and prompt: ${inputs.prompt.substring(0, 50)}...`);
           
           try {
             const response = await env.AI.run(model, inputs);
-  
-            // Processing the response of the flux-1-schnell model
-            if (data.model === 'flux-1-schnell') {
-              let jsonResponse;
-  
-              if (typeof response === 'object') {
-                jsonResponse = response;
-              } else {
-                try {
-                  jsonResponse = JSON.parse(response);
-                } catch (e) {
-                  console.error('Failed to parse JSON response:', e);
-                  return new Response(JSON.stringify({ 
-                    error: 'Failed to parse response',
-                    details: e.message
-                  }), { 
-                    status: 500,
-                    headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-                  });
-                }
-              }
-  
-              if (!jsonResponse.image) {
-                return new Response(JSON.stringify({ 
-                  error: 'Invalid response format',
-                  details: 'Image data not found in response'
-                }), { 
-                  status: 500,
-                  headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-                });
-              }
-  
-              try {
-                // Convert from base64 to binary data
-                const binaryString = atob(jsonResponse.image);
-                const bytes = new Uint8Array(binaryString.length);
-                for (let i = 0; i < binaryString.length; i++) {
-                  bytes[i] = binaryString.charCodeAt(i);
-                }
-  
-                // Returns binary data in PNG format
-                return new Response(bytes, {
-                  headers: {
-                    ...corsHeaders, 
-                    'content-type': 'image/png',
-                  },
-                });
-              } catch (e) {
-                console.error('Failed to convert base64 to binary:', e);
-                return new Response(JSON.stringify({ 
-                  error: 'Failed to process image data',
-                  details: e.message
-                }), { 
-                  status: 500,
-                  headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-                });
-              }
-            } else {
-                // Return the response directly
-                return new Response(response, {
-                  headers: {
-                    ...corsHeaders, 
-                    'content-type': 'image/png',
-                  },
-                });
-              }
+            const bytes = await toImageBytes(response, data.model);
+            const r2Stored = await uploadToR2IfEnabled(env, bytes, data.model);
+            const responseHeaders = {
+              ...corsHeaders,
+              'content-type': 'image/png',
+            };
+            if (r2Stored?.key) {
+              responseHeaders['X-R2-Key'] = r2Stored.key;
+            }
+            if (r2Stored?.url) {
+              responseHeaders['X-R2-Url'] = r2Stored.url;
+            }
+            return new Response(bytes, { headers: responseHeaders });
             } catch (aiError) {
             console.error('AI generation error:', aiError);
-            return new Response(JSON.stringify({ 
+            return jsonResponse({ 
               error: 'Image generation failed',
               details: aiError.message
-            }), { 
-              status: 500,
-              headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-            });
+            }, 500);
           }
         } else {
-          return new Response(JSON.stringify({ error: 'Missing required parameter: prompt or model' }), { 
-            status: 400, 
-            headers: { ...corsHeaders, 'Content-Type': 'application/json' } 
-          });
+          return jsonResponse({ error: 'Missing required parameter: prompt or model' }, 400);
         }
       } else if (path.endsWith('.html') || path === '/') {
         // redirect to index.html for HTML requests
@@ -243,10 +313,7 @@ export default {
       }
     } catch (error) {
       console.error('Worker error:', error);
-      return new Response(JSON.stringify({ error: 'Internal server error', details: error.message }), { 
-        status: 500,
-        headers: { ...corsHeaders, 'Content-Type': 'application/json' }
-      });
+      return jsonResponse({ error: 'Internal server error', details: error.message }, 500);
     }
   },
 };

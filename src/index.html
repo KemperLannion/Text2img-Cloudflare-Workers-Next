@@ -333,6 +333,12 @@
                             <i class="fa-solid fa-wand-magic-sparkles mr-1 text-xs"></i> 正向提示词
                         </label>
                         <textarea id="prompt" rows="3" placeholder="描述您想要生成的图像内容及样式..." class="w-full">cyberpunk cat</textarea>
+                        <div class="mt-2 flex gap-2">
+                            <input type="text" id="promptInputText" placeholder="输入自然语言，一键生成专业提示词..." class="w-full">
+                            <button id="generatePromptButton" class="btn btn-secondary text-sm py-1 px-3 whitespace-nowrap">
+                                <i class="fa-solid fa-bolt mr-1"></i> 生成提示词
+                            </button>
+                        </div>
                     </div>
                     
                     <div>
@@ -349,6 +355,20 @@
                         <select id="model" class="w-full">
                             <option value="loading" disabled selected>加载中...</option>
                         </select>
+                    </div>
+
+                    <div>
+                        <div class="flex items-center justify-between">
+                            <label for="useImageToImage" class="block text-sm font-medium mb-1 flex items-center">
+                                <i class="fa-solid fa-image mr-1 text-xs"></i> 图生图
+                            </label>
+                            <span id="img2imgSupportHint" class="text-xs text-gray-500">当前模型不支持</span>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <input id="useImageToImage" type="checkbox" class="w-auto">
+                            <span class="text-sm">启用图生图</span>
+                        </div>
+                        <input id="initImageFile" type="file" accept="image/*" class="mt-2 w-full hidden">
                     </div>
                 </div>
                 
@@ -476,6 +496,10 @@
                                 <span id="usedModel" class="ml-1">-</span>
                             </div>
                         </div>
+                        <div id="r2Info" class="text-sm hidden">
+                            <span class="font-medium">R2 地址：</span>
+                            <a id="r2Url" class="text-blue-500 underline break-all" target="_blank" rel="noopener noreferrer"></a>
+                        </div>
                         
                         <div id="allParamsContainer" class="hidden mt-3 border-t border-gray-200 dark:border-gray-700 pt-3">
                             <h3 class="text-sm font-medium mb-2 flex items-center">
@@ -495,6 +519,8 @@
             let availableModels = [];
             let randomPromptsList = [];
             let currentImageParams = {};
+            let workerConfig = { promptGeneratorEnabled: false, r2UploadEnabled: false, imageToImageDefaultStrength: 0.65 };
+            let initImageBase64 = '';
             
             // 加载模型列表
             async function loadModels() {
@@ -522,6 +548,7 @@
                     if (availableModels.length > 1) {
                         modelSelect.value = availableModels[1].id;
                     }
+                    updateImageToImageAvailability();
                 } catch (error) {
                     console.error('加载模型列表错误:', error);
                     showStatus('加载模型列表失败', 'error');
@@ -542,10 +569,26 @@
                     randomPromptsList = ['未能加载提示词列表，请重试或手动输入'];
                 }
             }
+
+            async function loadConfig() {
+                try {
+                    const response = await fetch('/api/config');
+                    if (!response.ok) return;
+                    workerConfig = await response.json();
+                    const button = document.getElementById('generatePromptButton');
+                    if (button && !workerConfig.promptGeneratorEnabled) {
+                        button.disabled = true;
+                        button.title = '已在 worker.js 中关闭';
+                    }
+                } catch (error) {
+                    console.error('加载配置错误:', error);
+                }
+            }
             
             // 初始化加载资源
             loadModels();
             loadRandomPrompts();
+            loadConfig();
             
             // 主题切换功能相关代码
             const themeToggle = document.getElementById('themeToggle');
@@ -627,6 +670,61 @@
                     showStatus('提示词列表未加载，请稍后再试', 'error');
                 }
             });
+
+            document.getElementById('generatePromptButton').addEventListener('click', async function() {
+                if (!workerConfig.promptGeneratorEnabled) {
+                    showStatus('提示词生成功能已关闭', 'warning');
+                    return;
+                }
+                const input = document.getElementById('promptInputText').value.trim();
+                if (!input) {
+                    showStatus('请输入自然语言描述', 'warning');
+                    return;
+                }
+                try {
+                    const response = await fetch('/api/prompt-generator', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ text: input })
+                    });
+                    const data = await response.json();
+                    if (!response.ok) throw new Error(data.error || '提示词生成失败');
+                    document.getElementById('prompt').value = data.prompt || input;
+                    showStatus('提示词生成成功', 'success');
+                } catch (error) {
+                    console.error('提示词生成错误:', error);
+                    showStatus(error.message || '提示词生成失败', 'error');
+                }
+            });
+
+            const useImageToImageCheckbox = document.getElementById('useImageToImage');
+            const initImageInput = document.getElementById('initImageFile');
+            const modelSelect = document.getElementById('model');
+            modelSelect.addEventListener('change', updateImageToImageAvailability);
+            useImageToImageCheckbox.addEventListener('change', function() {
+                initImageInput.classList.toggle('hidden', !this.checked);
+            });
+            initImageInput.addEventListener('change', async function() {
+                const file = this.files && this.files[0];
+                if (!file) {
+                    initImageBase64 = '';
+                    return;
+                }
+                initImageBase64 = await fileToDataUrl(file);
+            });
+
+            function updateImageToImageAvailability() {
+                const current = availableModels.find(m => m.id === modelSelect.value);
+                const supported = Boolean(current && current.supportsImageToImage);
+                const hint = document.getElementById('img2imgSupportHint');
+                hint.textContent = supported ? '当前模型支持' : '当前模型不支持';
+                useImageToImageCheckbox.disabled = !supported;
+                if (!supported) {
+                    useImageToImageCheckbox.checked = false;
+                    initImageInput.classList.add('hidden');
+                    initImageBase64 = '';
+                }
+            }
             
             // 复制参数
             document.getElementById('copyParamsButton').addEventListener('click', function() {
@@ -656,11 +754,14 @@
                     'prompt': '正向提示词',
                     'negative_prompt': '反向提示词',
                     'model': '文生图模型',
+                    'use_image_to_image': '图生图',
+                    'init_image': '参考图',
                     'width': '图像宽度',
                     'height': '图像高度',
                     'num_steps': '迭代步数',
                     'guidance': '引导系数',
-                    'seed': '随机种子'
+                    'seed': '随机种子',
+                    'strength': '重绘强度'
                 };
                 return nameMap[name] || name;
             }
@@ -724,6 +825,8 @@
                 const imageStatus = document.getElementById('imageStatus');
                 const copyParamsButton = document.getElementById('copyParamsButton');
                 const downloadButton = document.getElementById('downloadButton');
+                const r2Info = document.getElementById('r2Info');
+                if (r2Info) r2Info.classList.add('hidden');
                 
                 if (imageStatus) imageStatus.classList.add('hidden');
                 if (copyParamsButton) copyParamsButton.classList.add('hidden');
@@ -741,6 +844,17 @@
                     guidance: parseFloat(document.getElementById('guidance')?.value) || 7.5,
                     seed: parseInt(document.getElementById('seed')?.value) || Math.floor(Math.random() * 4294967295)
                 };
+                params.use_image_to_image = useImageToImageCheckbox.checked;
+                if (params.use_image_to_image) {
+                    if (!initImageBase64) {
+                        showStatus('请先上传图生图参考图片', 'warning');
+                        loadingOverlay.classList.add('hidden');
+                        initialPrompt.classList.remove('hidden');
+                        return;
+                    }
+                    params.init_image = initImageBase64;
+                    params.strength = workerConfig.imageToImageDefaultStrength || 0.65;
+                }
                 
                 // 保存当前参数
                 currentImageParams = {...params};
@@ -761,7 +875,7 @@
                         const contentType = response.headers.get('content-type');
                         if (contentType?.includes('application/json')) {
                             const errorData = await response.json();
-                            throw new Error(errorData.message || '生成失败');
+                            throw new Error(errorData.error || '生成失败');
                         } else {
                             const errorText = await response.text();
                             console.error('服务器错误:', errorText);
@@ -772,6 +886,7 @@
                     // 获取图像blob数据并转换为base64
                     const imageBlob = await response.blob();
                     const base64Image = await blobToBase64(imageBlob);
+                    const r2Url = response.headers.get('X-R2-Url');
                     const endTime = performance.now();
                     const generationTime = ((endTime - startTime) / 1000).toFixed(2);
                     
@@ -793,6 +908,15 @@
                         }
                         if (elements.usedModel) {
                             elements.usedModel.textContent = getModelNameById(params.model);
+                        }
+                        if (r2Url) {
+                            const r2InfoEl = document.getElementById('r2Info');
+                            const r2LinkEl = document.getElementById('r2Url');
+                            if (r2InfoEl && r2LinkEl) {
+                                r2LinkEl.href = r2Url;
+                                r2LinkEl.textContent = r2Url;
+                                r2InfoEl.classList.remove('hidden');
+                            }
                         }
                         
                         // 更新所有参数面板
@@ -822,6 +946,15 @@
                     reader.onloadend = () => resolve(reader.result);
                     reader.onerror = reject;
                     reader.readAsDataURL(blob);
+                });
+            }
+
+            function fileToDataUrl(file) {
+                return new Promise((resolve, reject) => {
+                    const reader = new FileReader();
+                    reader.onload = () => resolve(reader.result);
+                    reader.onerror = reject;
+                    reader.readAsDataURL(file);
                 });
             }
             
