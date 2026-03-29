@@ -134,10 +134,7 @@ function parseJsonIfPossible(text) {
   if (typeof text !== 'string') return null;
   try {
     return JSON.parse(text);
-  } catch (error) {
-    if (/^\s*[\[{]/.test(text)) {
-      console.debug('JSON parse failed in parseJsonIfPossible:', error?.message || error);
-    }
+  } catch {
     return null;
   }
 }
@@ -161,6 +158,9 @@ function extractImagePayload(data) {
 async function toImageBytes(response, modelId) {
   if (modelId === 'flux-1-schnell') {
     const parsed = typeof response === 'string' ? parseJsonIfPossible(response) : response;
+    if (typeof response === 'string' && !parsed) {
+      throw new Error('Invalid JSON response from flux model');
+    }
     const imagePayload = extractImagePayload(parsed);
     if (!imagePayload) {
       throw new Error('Image data not found in flux response');
