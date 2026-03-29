@@ -92,7 +92,11 @@ function clampNumber(value, min, max) {
 }
 
 function decodeBase64ToBytes(base64) {
-  const binaryString = atob(base64);
+  const normalized = String(base64 || '')
+    .trim()
+    .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')
+    .replace(/\s+/g, '');
+  const binaryString = atob(normalized);
   const bytes = new Uint8Array(binaryString.length);
   for (let i = 0; i < binaryString.length; i++) {
     bytes[i] = binaryString.charCodeAt(i);
@@ -119,13 +123,35 @@ function extractPromptText(response) {
   return '';
 }
 
+function parseJsonIfPossible(text) {
+  if (typeof text !== 'string') return null;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+function extractImagePayload(data) {
+  if (!data || typeof data !== 'object') return null;
+  return (
+    data.image ||
+    data.result?.image ||
+    data.output_image ||
+    data.data?.[0]?.b64_json ||
+    data.output?.[0]?.image ||
+    null
+  );
+}
+
 async function toImageBytes(response, modelId) {
   if (modelId === 'flux-1-schnell') {
-    const parsed = typeof response === 'string' ? JSON.parse(response) : response;
-    if (!parsed?.image) {
+    const parsed = typeof response === 'string' ? parseJsonIfPossible(response) : response;
+    const imagePayload = extractImagePayload(parsed);
+    if (!imagePayload) {
       throw new Error('Image data not found in flux response');
     }
-    return decodeBase64ToBytes(parsed.image);
+    return decodeBase64ToBytes(imagePayload);
   }
 
   if (response instanceof Uint8Array) return response;
@@ -134,8 +160,18 @@ async function toImageBytes(response, modelId) {
     const buffer = await new Response(response).arrayBuffer();
     return new Uint8Array(buffer);
   }
-  if (typeof response === 'object' && response?.image) return decodeBase64ToBytes(response.image);
-  if (typeof response === 'string') return decodeBase64ToBytes(response);
+  if (typeof response === 'object') {
+    const imagePayload = extractImagePayload(response);
+    if (imagePayload) return decodeBase64ToBytes(imagePayload);
+  }
+  if (typeof response === 'string') {
+    const parsed = parseJsonIfPossible(response);
+    if (parsed) {
+      const imagePayload = extractImagePayload(parsed);
+      if (imagePayload) return decodeBase64ToBytes(imagePayload);
+    }
+    return decodeBase64ToBytes(response);
+  }
 
   throw new Error('Unsupported image response format');
 }
