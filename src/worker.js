@@ -14,7 +14,9 @@ const ENABLE_PROMPT_GENERATOR = true;
 const PROMPT_GENERATOR_MODEL = '@cf/meta/llama-3.1-8b-instruct';
 const ENABLE_R2_UPLOAD = true;
 const R2_BUCKET_BINDING = 'IMAGE_BUCKET';
+// Set your R2 public custom domain base URL (e.g. https://img.example.com). Keep empty to only return object key.
 const R2_PUBLIC_BASE_URL = '';
+const DEFAULT_IMAGE_TO_IMAGE_STRENGTH = 0.65;
 
 // Available models list
 const AVAILABLE_MODELS = [
@@ -83,7 +85,7 @@ function jsonResponse(data, status = 200) {
   });
 }
 
-function clamp(value, min, max) {
+function clampNumber(value, min, max) {
   const num = Number(value);
   if (Number.isNaN(num)) return min;
   return Math.min(max, Math.max(min, num));
@@ -177,7 +179,8 @@ export default {
       } else if (path === '/api/config') {
         return jsonResponse({
           promptGeneratorEnabled: ENABLE_PROMPT_GENERATOR,
-          r2UploadEnabled: ENABLE_R2_UPLOAD && Boolean(env[R2_BUCKET_BINDING])
+          r2UploadEnabled: ENABLE_R2_UPLOAD && Boolean(env[R2_BUCKET_BINDING]),
+          imageToImageDefaultStrength: DEFAULT_IMAGE_TO_IMAGE_STRENGTH
         });
       } else if (path === '/api/prompts') {
         // get random prompts list
@@ -240,7 +243,7 @@ export default {
           
           // Input parameter processing
           if (data.model === 'flux-1-schnell') {
-            const steps = clamp(data.num_steps || 6, 4, 8);
+            const steps = clampNumber(data.num_steps || 6, 4, 8);
             
             // Only prompt and steps
             inputs = {
@@ -255,7 +258,7 @@ export default {
               height: data.height || 1024,
               width: data.width || 1024,
                 num_steps: data.num_steps || 20,
-                strength: clamp(data.strength || 0.65, 0, 1),
+                strength: clampNumber(data.strength || DEFAULT_IMAGE_TO_IMAGE_STRENGTH, 0, 1),
                 guidance: data.guidance || 7.5,
                 seed: data.seed || parseInt((Math.random() * 1024 * 1024).toString(), 10),
               };
