@@ -96,6 +96,9 @@ function decodeBase64ToBytes(base64) {
     .trim()
     .replace(/^data:image\/[a-zA-Z0-9.+-]+;base64,/, '')
     .replace(/\s+/g, '');
+  if (!normalized) {
+    throw new Error('Empty base64 image payload');
+  }
   const binaryString = atob(normalized);
   const bytes = new Uint8Array(binaryString.length);
   for (let i = 0; i < binaryString.length; i++) {
@@ -123,15 +126,26 @@ function extractPromptText(response) {
   return '';
 }
 
+/**
+ * Parse a JSON string safely.
+ * Returns parsed value for valid JSON strings, otherwise null.
+ */
 function parseJsonIfPossible(text) {
   if (typeof text !== 'string') return null;
   try {
     return JSON.parse(text);
-  } catch {
+  } catch (error) {
+    if (/^\s*[\[{]/.test(text)) {
+      console.debug('JSON parse failed in parseJsonIfPossible:', error?.message || error);
+    }
     return null;
   }
 }
 
+/**
+ * Extract base64 image payload from common Workers AI response shapes:
+ * image, result.image, output_image, data[0].b64_json, output[0].image.
+ */
 function extractImagePayload(data) {
   if (!data || typeof data !== 'object') return null;
   return (
